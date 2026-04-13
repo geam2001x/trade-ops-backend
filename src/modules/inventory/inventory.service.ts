@@ -28,6 +28,17 @@ export class InventoryService {
     private readonly dataSource: DataSource,
   ) {}
 
+  async findAllWarehouses(): Promise<WarehouseReference[]> {
+    return this.warehousesRepository.find({
+      where: {
+        isActive: true,
+      },
+      order: {
+        name: 'ASC',
+      },
+    });
+  }
+
   async receiveInventoryLot(
     receiveInventoryLotDto: ReceiveInventoryLotDto,
   ): Promise<InventoryLot> {

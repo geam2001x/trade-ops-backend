@@ -10,11 +10,17 @@ import {
 import { CreateInventoryMovementDto } from './dto/create-inventory-movement.dto';
 import { ReceiveInventoryLotDto } from './dto/receive-inventory-lot.dto';
 import { InventoryLot } from './entities/inventory-lot.entity';
+import { WarehouseReference } from './entities/warehouse-reference.entity';
 import { InventoryService } from './inventory.service';
 
 @Controller('inventory')
 export class InventoryController {
   constructor(private readonly inventoryService: InventoryService) {}
+
+  @Get('warehouses')
+  findAllWarehouses(): Promise<WarehouseReference[]> {
+    return this.inventoryService.findAllWarehouses();
+  }
 
   @Post('lots/receive')
   receiveInventoryLot(
@@ -46,4 +52,3 @@ export class InventoryController {
     );
   }
 }
-
