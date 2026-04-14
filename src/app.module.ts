@@ -10,6 +10,7 @@ import { CustomsModule } from './modules/customs/customs.module';
 import { DocumentProcessingModule } from './modules/document-processing/document-processing.module';
 import { FinanceModule } from './modules/finance/finance.module';
 import { InventoryModule } from './modules/inventory/inventory.module';
+import { MasterDataModule } from './modules/master-data/master-data.module';
 import { ProcurementModule } from './modules/procurement/procurement.module';
 import { RolesModule } from './modules/roles/roles.module';
 import { SalesModule } from './modules/sales/sales.module';
@@ -35,6 +36,7 @@ import { HealthModule } from './health/health.module';
     ShipmentsModule,
     CustomsModule,
     InventoryModule,
+    MasterDataModule,
     SalesModule,
     FinanceModule,
     DocumentProcessingModule,
