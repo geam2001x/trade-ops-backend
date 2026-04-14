@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { ScheduleModule } from '@nestjs/schedule';
 
 import appConfig from './config/app.config';
 import authConfig from './config/auth.config';
@@ -24,6 +25,7 @@ import { HealthModule } from './health/health.module';
       envFilePath: ['.env.local', '.env'],
       load: [appConfig, authConfig, databaseConfig],
     }),
+    ScheduleModule.forRoot(),
     DatabaseModule,
     HealthModule,
     RolesModule,
