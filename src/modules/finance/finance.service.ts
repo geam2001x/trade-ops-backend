@@ -1,4 +1,11 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { Cron } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
 
@@ -6,7 +13,37 @@ import { ImportExpense } from '../customs/entities/import-expense.entity';
 import { InventoryLot } from '../inventory/entities/inventory-lot.entity';
 import { SalesOrder } from '../sales/entities/sales-order.entity';
 import { AllocateImportExpenseDto } from './dto/allocate-import-expense.dto';
+import { SyncExchangeRatesDto } from './dto/sync-exchange-rates.dto';
+import { ExchangeRateSnapshot } from './entities/exchange-rate-snapshot.entity';
 import { LandedCostAllocation } from './entities/landed-cost-allocation.entity';
+
+const BCCH_DEFAULT_SERIES_ID = 'F073.TCO.PRE.Z.D';
+const BCCH_PUBLIC_SERIES_URL =
+  'https://si3.bcentral.cl/siete/ES/Siete/Cuadro/CAP_TIPO_CAMBIO/MN_TIPO_CAMBIO4/DOLAR_OBS_ADO?idSerie=F073.TCO.PRE.Z.D';
+const BCCH_HTTP_TIMEOUT_MS = 60_000;
+const BCCH_BROWSER_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'es-CL,es;q=0.9,en;q=0.8',
+};
+const BANCOESTADO_SIMULATOR_URL =
+  'https://www.bancoestado.cl/bancoestado/simulaciones/comercio/simule_1.asp';
+
+const SPANISH_MONTHS: Record<string, string> = {
+  ene: '01',
+  feb: '02',
+  mar: '03',
+  abr: '04',
+  may: '05',
+  jun: '06',
+  jul: '07',
+  ago: '08',
+  sep: '09',
+  oct: '10',
+  nov: '11',
+  dic: '12',
+};
 
 type ImportExpenseAllocationSummary = {
   importExpenseId: number;
@@ -67,19 +104,318 @@ type SalesOrderProfitability = {
   }>;
 };
 
+type LatestExchangeRate = {
+  baseCurrencyCode: string;
+  quoteCurrencyCode: string;
+  rate: number;
+  buyRate: number | null;
+  sellRate: number | null;
+  rateDate: string;
+  sourceName: string;
+  sourceUrl: string | null;
+  buySellSourceName: string | null;
+  buySellSourceUrl: string | null;
+  fetchedAt: string;
+};
+
+type ExchangeRateHistoryItem = LatestExchangeRate;
+
+type ExchangeRateSyncSummary = {
+  baseCurrencyCode: string;
+  quoteCurrencyCode: string;
+  firstDate: string;
+  lastDate: string;
+  processedCount: number;
+  importedCount: number;
+  updatedCount: number;
+  sourceName: string;
+  sourceUrl: string;
+  buySellSourceName: string | null;
+  buySellSourceUrl: string | null;
+};
+
+type NormalizedExchangeRateObservation = {
+  date: string;
+  rate: number;
+  sourceName: string;
+  sourceUrl: string;
+  buyRate?: number | null;
+  sellRate?: number | null;
+  buySellSourceName?: string | null;
+  buySellSourceUrl?: string | null;
+};
+
+function toIsoDateString(date: Date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function parseBcchApiDate(dateString: string) {
+  const [day, month, year] = dateString.split('-');
+  return `${year}-${month}-${day}`;
+}
+
+function parseSpanishObservationDate(
+  day: string,
+  monthLabel: string,
+  year: string,
+) {
+  const normalizedMonth = SPANISH_MONTHS[monthLabel.toLowerCase()];
+
+  if (!normalizedMonth) {
+    throw new Error(`Unsupported BCCh month label: ${monthLabel}`);
+  }
+
+  return `${year}-${normalizedMonth}-${day}`;
+}
+
+function parseBcchNumber(value: string) {
+  const normalized = value.replace(/\./g, '').replace(',', '.');
+  return Number.parseFloat(normalized);
+}
+
+function parseSlashDate(dateString: string) {
+  const [day, month, year] = dateString.split('/');
+  return `${year}-${month}-${day}`;
+}
+
 @Injectable()
 export class FinanceService {
+  private readonly logger = new Logger(FinanceService.name);
+
   constructor(
     @InjectRepository(LandedCostAllocation)
     private readonly landedCostAllocationsRepository: Repository<LandedCostAllocation>,
     @InjectRepository(ImportExpense)
     private readonly importExpensesRepository: Repository<ImportExpense>,
+    @InjectRepository(ExchangeRateSnapshot)
+    private readonly exchangeRateSnapshotsRepository: Repository<ExchangeRateSnapshot>,
     @InjectRepository(InventoryLot)
     private readonly inventoryLotsRepository: Repository<InventoryLot>,
     @InjectRepository(SalesOrder)
     private readonly salesOrdersRepository: Repository<SalesOrder>,
+    private readonly configService: ConfigService,
     private readonly dataSource: DataSource,
   ) {}
+
+  @Cron('15 13 * * 1-5', {
+    timeZone: 'America/Santiago',
+  })
+  async handleDailyExchangeRateSync() {
+    if (this.configService.get('FX_AUTO_SYNC_ENABLED') !== 'true') {
+      return;
+    }
+
+    const today = toIsoDateString(new Date());
+
+    try {
+      const summary = await this.syncExchangeRates({
+        firstDate: today,
+        lastDate: today,
+      });
+
+      this.logger.log(
+        `Exchange rate sync completed: ${summary.processedCount} snapshots processed for ${today}.`,
+      );
+    } catch (error) {
+      this.logger.error(
+        `Exchange rate sync failed for ${today}: ${
+          error instanceof Error ? error.message : 'unknown error'
+        }`,
+      );
+    }
+  }
+
+  async getLatestExchangeRate(
+    baseCurrencyCode = 'USD',
+    quoteCurrencyCode = 'CLP',
+  ): Promise<LatestExchangeRate> {
+    const snapshot = await this.exchangeRateSnapshotsRepository.findOne({
+      where: {
+        baseCurrencyCode: baseCurrencyCode.toUpperCase(),
+        quoteCurrencyCode: quoteCurrencyCode.toUpperCase(),
+      },
+      order: {
+        rateDate: 'DESC',
+        id: 'DESC',
+      },
+    });
+
+    if (!snapshot) {
+      throw new NotFoundException('Exchange rate snapshot not found');
+    }
+
+    return {
+      baseCurrencyCode: snapshot.baseCurrencyCode,
+      quoteCurrencyCode: snapshot.quoteCurrencyCode,
+      rate: Number(snapshot.rate),
+      buyRate: snapshot.buyRate ? Number(snapshot.buyRate) : null,
+      sellRate: snapshot.sellRate ? Number(snapshot.sellRate) : null,
+      rateDate: snapshot.rateDate.toISOString(),
+      sourceName: snapshot.sourceName,
+      sourceUrl: snapshot.sourceUrl,
+      buySellSourceName: snapshot.buySellSourceName,
+      buySellSourceUrl: snapshot.buySellSourceUrl,
+      fetchedAt: snapshot.fetchedAt.toISOString(),
+    };
+  }
+
+  async findExchangeRateHistory(
+    baseCurrencyCode = 'USD',
+    quoteCurrencyCode = 'CLP',
+    firstDate?: string,
+    lastDate?: string,
+  ): Promise<ExchangeRateHistoryItem[]> {
+    const normalizedBase = baseCurrencyCode.toUpperCase();
+    const normalizedQuote = quoteCurrencyCode.toUpperCase();
+
+    const query = this.exchangeRateSnapshotsRepository
+      .createQueryBuilder('snapshot')
+      .where('snapshot.baseCurrencyCode = :baseCurrencyCode', {
+        baseCurrencyCode: normalizedBase,
+      })
+      .andWhere('snapshot.quoteCurrencyCode = :quoteCurrencyCode', {
+        quoteCurrencyCode: normalizedQuote,
+      });
+
+    if (firstDate) {
+      query.andWhere('DATE(snapshot.rateDate) >= :firstDate', {
+        firstDate,
+      });
+    }
+
+    if (lastDate) {
+      query.andWhere('DATE(snapshot.rateDate) <= :lastDate', {
+        lastDate,
+      });
+    }
+
+    const snapshots = await query
+      .orderBy('snapshot.rateDate', 'DESC')
+      .addOrderBy('snapshot.id', 'DESC')
+      .getMany();
+
+    return snapshots.map((snapshot) => ({
+      baseCurrencyCode: snapshot.baseCurrencyCode,
+      quoteCurrencyCode: snapshot.quoteCurrencyCode,
+      rate: Number(snapshot.rate),
+      buyRate: snapshot.buyRate ? Number(snapshot.buyRate) : null,
+      sellRate: snapshot.sellRate ? Number(snapshot.sellRate) : null,
+      rateDate: snapshot.rateDate.toISOString(),
+      sourceName: snapshot.sourceName,
+      sourceUrl: snapshot.sourceUrl,
+      buySellSourceName: snapshot.buySellSourceName,
+      buySellSourceUrl: snapshot.buySellSourceUrl,
+      fetchedAt: snapshot.fetchedAt.toISOString(),
+    }));
+  }
+
+  async syncExchangeRates(
+    syncExchangeRatesDto: SyncExchangeRatesDto,
+  ): Promise<ExchangeRateSyncSummary> {
+    const baseCurrencyCode = (
+      syncExchangeRatesDto.baseCurrencyCode ?? 'USD'
+    ).toUpperCase();
+    const quoteCurrencyCode = (
+      syncExchangeRatesDto.quoteCurrencyCode ?? 'CLP'
+    ).toUpperCase();
+    const firstDate =
+      syncExchangeRatesDto.firstDate ?? toIsoDateString(new Date());
+    const lastDate = syncExchangeRatesDto.lastDate ?? firstDate;
+
+    if (baseCurrencyCode !== 'USD' || quoteCurrencyCode !== 'CLP') {
+      throw new BadRequestException(
+        'Only USD/CLP sync is implemented for the official BCCh source',
+      );
+    }
+
+    if (firstDate > lastDate) {
+      throw new BadRequestException('firstDate cannot be greater than lastDate');
+    }
+
+    const observations = await this.fetchUsdClpObservedSeries(
+      firstDate,
+      lastDate,
+    );
+
+    let importedCount = 0;
+    let updatedCount = 0;
+
+    for (const observation of observations) {
+      const [existingSnapshot] = await this.dataSource.query(
+        `
+          SELECT id
+          FROM exchange_rate_snapshots
+          WHERE base_currency_code = ?
+            AND quote_currency_code = ?
+            AND DATE(rate_date) = ?
+          LIMIT 1
+        `,
+        [baseCurrencyCode, quoteCurrencyCode, observation.date],
+      );
+
+      await this.dataSource.query(
+        `
+          INSERT INTO exchange_rate_snapshots (
+            base_currency_code,
+            quote_currency_code,
+            rate,
+            buy_rate,
+            sell_rate,
+          rate_date,
+          source_name,
+          source_url,
+          buy_sell_source_name,
+          buy_sell_source_url
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON DUPLICATE KEY UPDATE
+            rate = VALUES(rate),
+            buy_rate = VALUES(buy_rate),
+            sell_rate = VALUES(sell_rate),
+            source_name = VALUES(source_name),
+            source_url = VALUES(source_url),
+            buy_sell_source_name = VALUES(buy_sell_source_name),
+            buy_sell_source_url = VALUES(buy_sell_source_url)
+        `,
+        [
+          baseCurrencyCode,
+          quoteCurrencyCode,
+          observation.rate.toFixed(6),
+          observation.buyRate ? observation.buyRate.toFixed(6) : null,
+          observation.sellRate ? observation.sellRate.toFixed(6) : null,
+          `${observation.date} 12:00:00`,
+          observation.sourceName,
+          observation.sourceUrl,
+          observation.buySellSourceName ?? null,
+          observation.buySellSourceUrl ?? null,
+        ],
+      );
+
+      if (existingSnapshot) {
+        updatedCount += 1;
+      } else {
+        importedCount += 1;
+      }
+    }
+
+    return {
+      baseCurrencyCode,
+      quoteCurrencyCode,
+      firstDate,
+      lastDate,
+      processedCount: observations.length,
+      importedCount,
+      updatedCount,
+      sourceName: observations[0]?.sourceName ?? 'BCCh',
+      sourceUrl: observations[0]?.sourceUrl ?? BCCH_PUBLIC_SERIES_URL,
+      buySellSourceName: observations.find(
+        (observation) => observation.buySellSourceName,
+      )?.buySellSourceName ?? null,
+      buySellSourceUrl: observations.find(
+        (observation) => observation.buySellSourceUrl,
+      )?.buySellSourceUrl ?? null,
+    };
+  }
 
   async allocateImportExpense(
     importExpenseId: number,
@@ -411,5 +747,242 @@ export class FinanceService {
       .getRawOne<{ total: string }>();
 
     return Number(row?.total ?? 0);
+  }
+
+  private async fetchUsdClpObservedSeries(
+    firstDate: string,
+    lastDate: string,
+  ): Promise<NormalizedExchangeRateObservation[]> {
+    const bcchUser = this.configService.get<string>('FX_BCCH_USER');
+    const bcchPass = this.configService.get<string>('FX_BCCH_PASS');
+    let observations: NormalizedExchangeRateObservation[];
+
+    if (bcchUser && bcchPass) {
+      observations = await this.fetchUsdClpObservedSeriesFromApi(
+        bcchUser,
+        bcchPass,
+        firstDate,
+        lastDate,
+      );
+    } else {
+      observations = await this.fetchUsdClpObservedSeriesFromPublicPage(
+        firstDate,
+        lastDate,
+      );
+    }
+
+    return this.enrichWithBancoEstadoBuySell(observations);
+  }
+
+  private async fetchUsdClpObservedSeriesFromApi(
+    user: string,
+    pass: string,
+    firstDate: string,
+    lastDate: string,
+  ): Promise<NormalizedExchangeRateObservation[]> {
+    const seriesId =
+      this.configService.get<string>('FX_BCCH_SERIES_ID') ??
+      BCCH_DEFAULT_SERIES_ID;
+    const params = new URLSearchParams({
+      user,
+      pass,
+      firstdate: firstDate,
+      lastdate: lastDate,
+      timeseries: seriesId,
+      function: 'GetSeries',
+    });
+
+    const response = await this.fetchBcchResource(
+      `https://si3.bcentral.cl/SieteRestWS/SieteRestWS.ashx?${params.toString()}`,
+      {
+        headers: {
+          Accept: 'application/json',
+        },
+      },
+    );
+
+    if (!response.ok) {
+      throw new BadRequestException(
+        `BCCh API request failed with status ${response.status}`,
+      );
+    }
+
+    const payload = (await response.json()) as {
+      Codigo: number;
+      Descripcion: string;
+      Series?: {
+        Obs?: Array<{
+          indexDateString: string;
+          value: string;
+          statusCode: string;
+        }>;
+      };
+    };
+
+    if (payload.Codigo !== 0) {
+      throw new BadRequestException(
+        `BCCh API error: ${payload.Descripcion ?? 'unknown error'}`,
+      );
+    }
+
+    return (payload.Series?.Obs ?? [])
+      .filter((observation) => observation.statusCode === 'OK')
+      .map((observation) => ({
+        date: parseBcchApiDate(observation.indexDateString),
+        rate: Number.parseFloat(observation.value),
+        sourceName: 'BCCh API BDE',
+        sourceUrl:
+          'https://si3.bcentral.cl/estadisticas/Principal1/Web_Services/doc_es.htm',
+      }));
+  }
+
+  private async fetchUsdClpObservedSeriesFromPublicPage(
+    firstDate: string,
+    lastDate: string,
+  ): Promise<NormalizedExchangeRateObservation[]> {
+    const response = await this.fetchBcchResource(BCCH_PUBLIC_SERIES_URL, {
+      headers: BCCH_BROWSER_HEADERS,
+    });
+
+    if (!response.ok) {
+      throw new BadRequestException(
+        `BCCh public page request failed with status ${response.status}`,
+      );
+    }
+
+    const html = await response.text();
+    const regex =
+      /<tr>\s*<td>\s*(\d{2})\.([A-Za-zÁÉÍÓÚáéíóú]{3})\.(\d{4})\s*<\/td>\s*<td>\s*([\d\.,]+)\s*<\/td>\s*<\/tr>/g;
+    const observations = new Map<string, NormalizedExchangeRateObservation>();
+
+    let match: RegExpExecArray | null = regex.exec(html);
+    while (match) {
+      const [, day, monthLabel, year, rawValue] = match;
+      const observationDate = parseSpanishObservationDate(day, monthLabel, year);
+
+      if (observationDate >= firstDate && observationDate <= lastDate) {
+        observations.set(observationDate, {
+          date: observationDate,
+          rate: parseBcchNumber(rawValue),
+          sourceName: 'BCCh BDE public page',
+          sourceUrl: BCCH_PUBLIC_SERIES_URL,
+        });
+      }
+
+      match = regex.exec(html);
+    }
+
+    if (observations.size === 0) {
+      throw new BadRequestException(
+        'BCCh public page returned no observations for the requested date range',
+      );
+    }
+
+    return [...observations.values()].sort((left, right) =>
+      left.date.localeCompare(right.date),
+    );
+  }
+
+  private async enrichWithBancoEstadoBuySell(
+    observations: NormalizedExchangeRateObservation[],
+  ): Promise<NormalizedExchangeRateObservation[]> {
+    if (observations.length === 0) {
+      return observations;
+    }
+
+    try {
+      const bancoEstadoQuote = await this.fetchBancoEstadoUsdClpQuote();
+
+      return observations.map((observation) => {
+        if (observation.date !== bancoEstadoQuote.date) {
+          return observation;
+        }
+
+        return {
+          ...observation,
+          buyRate: bancoEstadoQuote.buyRate,
+          sellRate: bancoEstadoQuote.sellRate,
+          buySellSourceName: bancoEstadoQuote.buySellSourceName,
+          buySellSourceUrl: bancoEstadoQuote.buySellSourceUrl,
+        };
+      });
+    } catch (error) {
+      this.logger.warn(
+        `BancoEstado buy/sell quote could not be fetched: ${
+          error instanceof Error ? error.message : 'unknown error'
+        }`,
+      );
+
+      return observations;
+    }
+  }
+
+  private async fetchBancoEstadoUsdClpQuote(): Promise<
+    Required<
+      Pick<
+        NormalizedExchangeRateObservation,
+        'date' | 'buyRate' | 'sellRate' | 'buySellSourceName' | 'buySellSourceUrl'
+      >
+    >
+  > {
+    const response = await this.fetchBcchResource(BANCOESTADO_SIMULATOR_URL, {
+      headers: BCCH_BROWSER_HEADERS,
+    });
+
+    if (!response.ok) {
+      throw new BadRequestException(
+        `BancoEstado simulator request failed with status ${response.status}`,
+      );
+    }
+
+    const html = await response.text();
+    const clientBuyMatch = html.match(
+      /compra-dolares"\)\.checked == true\)\{\s*TotalValor = sinpunto \* ([0-9]+(?:\.[0-9]+)?);/i,
+    );
+    const clientSellMatch = html.match(
+      /venta-dolares"\)\.checked == true\)\{\s*TotalValor = sinpunto \* ([0-9]+(?:\.[0-9]+)?);/i,
+    );
+    const dateMatch = html.match(
+      /document\.getElementById\("Fecha"\)\.value = "(\d{2}\/\d{2}\/\d{4})";/i,
+    );
+
+    if (!clientBuyMatch || !clientSellMatch || !dateMatch) {
+      throw new BadRequestException(
+        'BancoEstado simulator returned an unsupported HTML structure',
+      );
+    }
+
+    return {
+      date: parseSlashDate(dateMatch[1]),
+      buyRate: Number.parseFloat(clientSellMatch[1]),
+      sellRate: Number.parseFloat(clientBuyMatch[1]),
+      buySellSourceName: 'BancoEstado simulador compra/venta USD',
+      buySellSourceUrl: BANCOESTADO_SIMULATOR_URL,
+    };
+  }
+
+  private async fetchBcchResource(
+    url: string,
+    init?: RequestInit,
+  ): Promise<Response> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), BCCH_HTTP_TIMEOUT_MS);
+
+    try {
+      return await fetch(url, {
+        ...init,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new BadRequestException(
+          `BCCh request timed out after ${BCCH_HTTP_TIMEOUT_MS / 1000} seconds`,
+        );
+      }
+
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 }
